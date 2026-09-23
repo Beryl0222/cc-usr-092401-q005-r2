@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from domain import (
+    CONFLICTS_KEY,
     DomainError,
     Lab,
     NotFoundError,
@@ -148,10 +149,25 @@ class Handler(BaseHTTPRequestHandler):
                 rest = path[len("/tasks/"):]
                 if rest.endswith("/events"):
                     task_id = unquote(rest[: -len("/events")])
+                    # 结构性非法会在领域层整批失败（不落盘、400）；内容冲突
+                    # 时合法的不相交事件已提交并持久化，返回 409 与冲突定位。
                     result = STORE.call(
                         lab.ingest_events, task_id, payload.get("events", []), persist=True
                     )
-                    self._send_json(202, result)
+                    if result.get(CONFLICTS_KEY):
+                        conflicts = result[CONFLICTS_KEY]
+                        body = {
+                            "error": "evidence_conflict",
+                            "message": (
+                                f"任务 {task_id} 有 {len(conflicts)} 条事件与已留存证据"
+                                "内容不同，原证据已保留，冲突事件未覆盖"
+                            ),
+                            "task_id": task_id,
+                        }
+                        body.update(result)
+                        self._send_json(409, body)
+                    else:
+                        self._send_json(202, result)
                     return
                 if rest.endswith("/complete"):
                     task_id = unquote(rest[: -len("/complete")].rstrip("/"))

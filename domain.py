@@ -13,6 +13,8 @@
   开启新的周期并累计回潮次数。
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from itertools import count
 from time import time
@@ -89,6 +91,35 @@ class DomainError(ValueError):
 
 class NotFoundError(LookupError):
     """引用的实体不存在。"""
+
+
+# 内容冲突在批次结果中的固定字段名，服务层据此返回 HTTP 409
+CONFLICTS_KEY = "conflicts"
+
+
+def _canonical_event(raw):
+    """提取入库留存的白名单业务字段（与快照中可重建的内容完全一致）。"""
+    return {
+        "event_id": raw["event_id"],
+        "seq": raw["seq"],
+        "type": raw["type"],
+        "occurred_at": raw["occurred_at"],
+        "payload": raw.get("payload") or {},
+    }
+
+
+def event_content_hash(raw):
+    """对事件业务内容计算规范化摘要（SHA-256）。
+
+    只覆盖实际留存的白名单字段（event_id/seq/type/occurred_at/payload），
+    以紧凑、排序键、无多余空白的 UTF-8 JSON 序列化；因此同一次上传入库后
+    再从快照重建，摘要必然一致。重传时内容逐字段一致才算完全重传，任何
+    差异都会暴露为证据冲突。
+    """
+    canonical = json.dumps(
+        _canonical_event(raw), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _require(payload, key, entity):
@@ -255,40 +286,123 @@ class Lab:
     def ingest_events(self, task_id, events):
         """幂等接收一批事件。
 
-        同一 (task_id, event_id) 重传直接判重，不产生重复证据；
-        任务完成后到达的迟到事件照常追加，并触发追加判定。
+        接收流程严格分两阶段：
+
+        1. 整批先做字段、序号、时间、事件类型校验。该阶段只读仓储，任何
+           一条不合规都会整批失败、不留下任何痕迹（任务、发现、案件、磁盘
+           快照都不变）。
+        2. 结构全部合规后，再按 ``(task_id, event_id)`` 与规范化内容摘要
+           对每条定性：新事件原子提交；摘要一致的计为完全重传（duplicates）；
+           同键异内容是证据冲突——冲突项绝不覆盖原证据，而本批中与其不相
+           交的合法新事件照常落库（相交并发批次的合法部分不能丢），冲突清
+           单放入结果 ``conflicts``（HTTP 层映射为 409，可按 event_id/seq/
+           index 定位）。
+
+        任务完成后到达的迟到事件标记 ``late=true`` 并触发一次追加判定；
+        乱序（``occurred_at`` 早于既有事件，或序号跳号后补）允许到达，只
+        触发规则重算，绝不回改任务固化的规范/脚本版本；判定按稳定指纹去
+        重，不重复生成发现，也不重复出具整改通知。
         """
         task = self._get_task(task_id)
-        accepted, duplicates = [], []
-        late = False
-        for raw in events:
+        if not isinstance(events, list):
+            raise DomainError("事件批次必须是数组：{\"events\": [...]}")
+
+        # ---- 阶段一：整批校验（只读，不触碰任何仓储状态）---- #
+        prepared = []
+        seen_ids, seen_seqs = set(), set()
+        for index, raw in enumerate(events):
+            where = f"批次第 {index + 1} 条"
+            if not isinstance(raw, dict):
+                raise DomainError(f"{where}不是合法事件对象")
             event_id = _require(raw, "event_id", "事件")
-            dedup_key = (task_id, event_id)
-            if dedup_key in self.events:
-                duplicates.append(event_id)
-                continue
             event_type = _require(raw, "type", "事件")
             if event_type not in EVENT_TYPES:
-                raise DomainError(f"未知事件类型：{event_type}")
+                raise DomainError(
+                    f"{where}（event_id={event_id}）未知事件类型：{event_type}"
+                )
+            seq = _require(raw, "seq", "事件")
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
+                raise DomainError(
+                    f"{where}（event_id={event_id}）序号 seq 必须是正整数，实际：{seq!r}"
+                )
+            occurred_at = _require(raw, "occurred_at", "事件")
+            if not isinstance(occurred_at, (int, float)) or isinstance(occurred_at, bool):
+                raise DomainError(
+                    f"{where}（event_id={event_id}）occurred_at 必须是 UNIX 时间戳（数字）"
+                )
+            if occurred_at > self.clock() + 300:
+                raise DomainError(
+                    f"{where}（event_id={event_id}）occurred_at={occurred_at} 晚于当前"
+                    "时间（容忍 300s 时钟偏差），不接受来自未来的事件"
+                )
+            if "payload" in raw and not isinstance(raw["payload"], dict):
+                raise DomainError(f"{where}（event_id={event_id}）payload 必须是对象")
+            if event_id in seen_ids:
+                raise DomainError(f"{where}批次内事件号重复：{event_id}")
+            if seq in seen_seqs:
+                raise DomainError(f"{where}（event_id={event_id}）批次内序号重复：seq={seq}")
+            seen_ids.add(event_id)
+            seen_seqs.add(seq)
+            prepared.append((index, event_id, seq, event_type, occurred_at, raw))
+
+        # 序号只要求正整数且任务内唯一、与事件号一一对应；允许跳号与乱序
+        # 到达（缺口代表事件尚未到齐，之后可以补），但同一序号不能被不同
+        # 事件号占用。
+        existing = [self.events[(task_id, eid)] for eid in task["event_ids"]]
+        seq_owner = {e["seq"]: e["event_id"] for e in existing}
+        for _, event_id, seq, _, _, _ in prepared:
+            owner = seq_owner.get(seq)
+            if owner is not None and owner != event_id:
+                raise DomainError(
+                    f"任务 {task_id} 序号 seq={seq} 已属于事件 {owner}，"
+                    f"本次事件 {event_id} 不能占用同一序号"
+                )
+
+        accepted, duplicates, to_commit = [], [], []
+        conflicts = []
+        for index, event_id, seq, event_type, occurred_at, raw in prepared:
+            stored = self.events.get((task_id, event_id))
+            if stored is not None:
+                incoming_hash = event_content_hash(raw)
+                if stored["content_hash"] != incoming_hash:
+                    conflicts.append({
+                        "event_id": event_id,
+                        "seq": seq,
+                        "index": index,
+                        "stored_hash": stored["content_hash"],
+                        "incoming_hash": incoming_hash,
+                    })
+                else:
+                    duplicates.append(event_id)
+                continue
+            to_commit.append((event_id, seq, event_type, occurred_at, raw))
+
+        # ---- 阶段二：结构全部合规后原子提交合法的不相交事件 ----
+        # 同键异内容只拒绝冲突项本身（原证据原样保留），与本批相交批次无
+        # 关的合法事件照常落库，冲突通过结果清单可定位（HTTP 409）。
+        is_late = task["status"] == "completed"
+        received_at = self.clock()
+        for event_id, seq, event_type, occurred_at, raw in to_commit:
             event = {
                 "event_id": event_id,
                 "task_id": task_id,
-                "seq": _require(raw, "seq", "事件"),
+                "seq": seq,
                 "type": event_type,
-                "occurred_at": _require(raw, "occurred_at", "事件"),
-                "received_at": self.clock(),
-                "late": task["status"] == "completed",
+                "occurred_at": occurred_at,
+                "received_at": received_at,
+                "late": is_late,
                 "payload": raw.get("payload", {}),
+                "content_hash": event_content_hash(raw),
             }
-            self.events[dedup_key] = event
+            self.events[(task_id, event_id)] = event
             task["event_ids"].append(event_id)
             accepted.append(event_id)
-            if event["late"]:
-                late = True
         result = {"accepted": accepted, "duplicates": duplicates}
-        if accepted and task["status"] == "completed":
+        if conflicts:
+            result[CONFLICTS_KEY] = conflicts
+        if accepted and is_late:
             result["assessment"] = self._evaluate(task)
-            result["late_arrivals"] = late
+            result["late_arrivals"] = True
         return result
 
     def complete_task(self, task_id):
@@ -331,12 +445,18 @@ class Lab:
             return None
 
         def add_finding(rule_id, ad_info, subject, chain, evidence, detail, occurred_at):
-            fingerprint = "|".join(
-                [rule_id, str(ad_info.get("ad_id", "")), str(ad_info.get("placement", "")),
-                 _subject_key(subject)[0], _subject_key(subject)[1]] + sorted(evidence)
-            )
+            # 指纹只取「规则 + 广告位 + 责任主体」这一稳定身份：乱序/迟到补来
+            # 的证据事件不得改变指纹，否则重算会把同一违规重复生成成多条发现。
+            fingerprint = "|".join([
+                rule_id, str(ad_info.get("ad_id", "")),
+                str(ad_info.get("placement", "")),
+                _subject_key(subject)[0], _subject_key(subject)[1],
+            ])
             existing = first_existing(fingerprint)
             if existing:
+                # 证据只增不改：补来的事件并入既有发现，结论/详情/时间均不回改
+                merged = set(existing["evidence_event_ids"]) | set(evidence)
+                existing["evidence_event_ids"] = sorted(merged)
                 return existing
             finding = {
                 "finding_id": self._new_id("finding"),
@@ -807,4 +927,37 @@ class Lab:
         for name in cls._TUPLE_DICTS:
             setattr(lab, name, {tuple(item["key"]): item["value"] for item in data.get(name, [])})
         lab._seq = count(data.get("next_seq", 1))
+        lab._verify_snapshot()
         return lab
+
+    def _verify_snapshot(self):
+        """重启恢复时核对快照：事件内容摘要、任务-事件引用、发现证据引用。
+
+        * 旧快照缺少 ``content_hash`` 时按留存字段重建补齐；
+        * 已记录摘要与重建摘要不一致，说明磁盘证据被篡改，直接拒绝启动，
+          避免在被污染的证据上继续判定与出告知材料；
+        * 任务 ``event_ids`` 与事件仓储、发现证据引用必须双向对得上。
+        """
+        for key, event in self.events.items():
+            task_id, event_id = key
+            if event.get("task_id") != task_id or event.get("event_id") != event_id:
+                raise DomainError(f"快照事件键与内容不一致：{key}")
+            digest = event_content_hash(_canonical_event(event))
+            stored = event.get("content_hash")
+            if stored is None:
+                event["content_hash"] = digest  # 旧版快照补齐
+            elif stored != digest:
+                raise DomainError(
+                    f"快照证据被篡改：任务 {task_id} 事件 {event_id} 的内容摘要不一致"
+                    f"（已记录 {stored}，实际 {digest}），拒绝恢复"
+                )
+        for task_id, task in self.tasks.items():
+            for eid in task["event_ids"]:
+                if (task_id, eid) not in self.events:
+                    raise DomainError(f"快照任务 {task_id} 引用了不存在的事件：{eid}")
+        for finding in self.findings.values():
+            for eid in finding.get("evidence_event_ids", []):
+                if (finding["task_id"], eid) not in self.events:
+                    raise DomainError(
+                        f"快照发现 {finding['finding_id']} 引用了不存在的证据事件：{eid}"
+                    )

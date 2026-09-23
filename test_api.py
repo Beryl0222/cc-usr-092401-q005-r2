@@ -229,6 +229,170 @@ class ApiFlowTest(unittest.TestCase):
             if os.path.exists(path):
                 os.unlink(path)
 
+    # ------------------------------------------------------------------ #
+    # 批次接收：整批回滚、内容冲突、重启核对、并发交叠
+    # ------------------------------------------------------------------ #
+
+    def _evt(self, eid, seq, etype="gesture", at=None, payload=None):
+        return {"event_id": eid, "seq": seq, "type": etype,
+                "occurred_at": NOW + 100 + seq,
+                "payload": payload if payload is not None else {"kind": "tap"}}
+
+    def test_mixed_bad_batch_is_fully_rolled_back(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        tid = task["task_id"]
+        mixed = [
+            ad("a1"),
+            close("a1", 2, after=1, size=48),
+            {"event_id": "e-bad", "seq": 3, "type": "bogus_type",
+             "occurred_at": NOW + 103, "payload": {}},
+        ]
+        status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                            {"events": mixed})
+        self.assertEqual(status, 400, body)
+        # 前序合法事件不得留下痕迹
+        report = self.get(f"/tasks/{tid}")
+        self.assertEqual(report["event_count"], 0)
+
+        # 随后的合法批次正常保存（回滚事件不会被快照悄悄持久化）
+        status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                            {"events": mixed[:2]})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body["accepted"], ["e-a1-shown", "e-a1-close-2"])
+        self.get(f"/tasks/{tid}")
+
+    def test_same_key_different_content_returns_locatable_409_keeps_original(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        tid = task["task_id"]
+        self.post(f"/tasks/{tid}/events", 202, {"events": [ad("a1")]})
+
+        mutated = ad("a1")
+        mutated["payload"]["placement"] = "lockscreen"  # 同 event_id，不同内容
+        disjoint = close("a1", 2, after=1, size=48)
+        status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                            {"events": [mutated, disjoint]})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "evidence_conflict")
+        self.assertEqual(body["task_id"], tid)
+        conflict = body["conflicts"][0]
+        self.assertEqual(conflict["event_id"], "e-a1-shown")
+        self.assertEqual(conflict["index"], 0)
+        self.assertNotEqual(conflict["stored_hash"], conflict["incoming_hash"])
+        # 与冲突项不相交的合法事件不能丢
+        self.assertEqual(body["accepted"], ["e-a1-close-2"])
+        # 原证据保留
+        report = self.get(f"/tasks/{tid}")
+        self.assertEqual(report["event_count"], 2)
+
+        # 完全重传仍计为重复（202）
+        status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                            {"events": [ad("a1")]})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body["duplicates"], ["e-a1-shown"])
+
+    def test_restart_reloads_snapshot_and_still_detects_conflict(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self._seed()
+            task = self._create_task("dev-A", "normal")
+            tid = task["task_id"]
+            self.post(f"/tasks/{tid}/events", 202, {"events": [ad("a1")]})
+            # 重启：快照核对通过，证据恢复
+            service.reset_store(path)
+            report = self.get(f"/tasks/{tid}")
+            self.assertEqual(report["event_count"], 1)
+            # 重启后同键异内容仍被识别为冲突
+            mutated = ad("a1")
+            mutated["payload"]["placement"] = "lockscreen"
+            status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                                {"events": [mutated]})
+            self.assertEqual(status, 409, body)
+            self.assertEqual(body["conflicts"][0]["event_id"], "e-a1-shown")
+
+            # 篡改磁盘快照：重启必须拒绝恢复
+            service.STORE.save()
+            with open(path, "r", encoding="utf-8") as handle:
+                on_disk = json.load(handle)
+            for item in on_disk["events"]:
+                item["value"]["payload"]["placement"] = "tampered"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(on_disk, handle, ensure_ascii=False)
+            with self.assertRaises(Exception):
+                service.Store(path)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_concurrent_overlapping_batches_keep_disjoint_and_flag_conflict(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        tid = task["task_id"]
+
+        # 两条相交批次并发：共享事件 e-overlap（同键异内容）+ 各自独有事件
+        batch_a = [self._evt("e-overlap", 1, payload={"v": "A"}),
+                   self._evt("e-only-a", 2)]
+        batch_b = [self._evt("e-overlap", 1, payload={"v": "B"}),
+                   self._evt("e-only-b", 3)]
+        results = []
+
+        def upload(batch):
+            results.append(call("POST", f"{self.base}/tasks/{tid}/events",
+                                {"events": batch}))
+
+        t1 = threading.Thread(target=upload, args=(batch_a,))
+        t2 = threading.Thread(target=upload, args=(batch_b,))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses, [202, 409])  # 先到者接受，后到者冲突
+        conflict_body = next(body for status, body in results if status == 409)
+        self.assertEqual(conflict_body["conflicts"][0]["event_id"], "e-overlap")
+        # 两个不相交的独有事件都不得丢失
+        report = self.get(f"/tasks/{tid}")
+        self.assertEqual(report["event_count"], 3)
+
+    def test_concurrent_identical_overlap_is_deduped_without_loss(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        tid = task["task_id"]
+        shared = self._evt("e-shared", 1)
+
+        def upload(i):
+            batch = [dict(shared), self._evt(f"e-only-{i}", i + 2)]
+            status, body = call("POST", f"{self.base}/tasks/{tid}/events",
+                                {"events": batch})
+            return status, body
+
+        with ThreadPool(8) as pool:
+            outcomes = list(pool.map(upload, range(8)))
+
+        statuses = sorted(status for status, _ in outcomes)
+        self.assertEqual(statuses.count(202), 8)  # 内容一致，均无冲突
+        accepted = {eid for _, body in outcomes for eid in body["accepted"]}
+        self.assertEqual(accepted, {f"e-only-{i}" for i in range(8)} | {"e-shared"})
+        report = self.get(f"/tasks/{tid}")
+        self.assertEqual(report["event_count"], 9)
+
+
+class ThreadPool:
+    """极简线程池上下文（避免在测试中直接暴露 executor 导入差异）。"""
+
+    def __init__(self, workers):
+        from concurrent.futures import ThreadPoolExecutor
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+
+    def __enter__(self):
+        return self._executor
+
+    def __exit__(self, *exc):
+        self._executor.shutdown(wait=True)
+        return False
+
 
 if __name__ == "__main__":
     unittest.main()
