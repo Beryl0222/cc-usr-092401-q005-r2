@@ -230,5 +230,174 @@ class ApiFlowTest(unittest.TestCase):
                 os.unlink(path)
 
 
+    def test_bad_batch_is_rejected_and_persists_nothing(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self._seed()
+            task = self._create_task("dev-A", "normal")
+
+            # 前两条合法、末条类型非法：整批 400，磁盘快照也不得留下前序事件
+            bad = [ad("a1"), close("a1", 2, after=5, size=36),
+                   {"event_id": "e-bad", "seq": 3, "type": "trojan",
+                    "occurred_at": NOW + 200, "payload": {}}]
+            status, body = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                {"events": bad})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "domain_error")
+            report = self.get(f"/tasks/{task['task_id']}")
+            self.assertEqual(report["event_count"], 0)
+            with open(path, "r", encoding="utf-8") as handle:
+                snap = json.load(handle)
+            self.assertEqual(snap["events"], [])
+
+            # 下一条合法批次正常落盘，且不含坏批次前序事件
+            self.post(f"/tasks/{task['task_id']}/events", 202,
+                      {"events": [ad("z1"), close("z1", 2, after=1, size=48)]})
+            with open(path, "r", encoding="utf-8") as handle:
+                snap = json.load(handle)
+            ids = {item["key"][1] for item in snap["events"]}
+            self.assertEqual(ids, {"e-z1-shown", "e-z1-close-2"})
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_snapshot_reload_keeps_dedup_and_locates_conflict(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self._seed()
+            task = self._create_task("dev-A", "normal")
+            self.post(f"/tasks/{task['task_id']}/events", 202, {"events": [ad("a1")]})
+
+            # 重启恢复：完全重传仍判重（依据规范化内容摘要）
+            service.reset_store(path)
+            status, body = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                {"events": [ad("a1")]})
+            self.assertEqual(status, 202)
+            self.assertEqual(body["duplicates"], ["e-a1-shown"])
+            self.assertEqual(body["accepted"], [])
+
+            # 同键异内容：返回 evidence_conflict 与可定位冲突，原证据保留
+            tampered = dict(ad("a1"))
+            tampered["payload"] = {"ad_id": "a1", "placement": "lockscreen"}
+            status, body = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                {"events": [tampered]})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "evidence_conflict")
+            self.assertEqual(body["conflicts"][0]["event_id"], "e-a1-shown")
+            self.assertEqual(body["conflicts"][0]["task_id"], task["task_id"])
+            self.assertTrue(body["conflicts"][0]["stored_digest"])
+
+            # 再重启后冲突仍被识别（摘要随快照持久化）
+            service.reset_store(path)
+            status, body = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                {"events": [tampered]})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "evidence_conflict")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_legacy_snapshot_without_digest_still_dedups_by_content(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self._seed()
+            task = self._create_task("dev-A", "normal")
+            self.post(f"/tasks/{task['task_id']}/events", 202, {"events": [ad("a1")]})
+            # 模拟旧版快照：剥除事件摘要字段后重启
+            with open(path, "r", encoding="utf-8") as handle:
+                snap = json.load(handle)
+            for item in snap["events"]:
+                item["value"].pop("digest", None)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(snap, handle, ensure_ascii=False)
+
+            service.reset_store(path)
+            status, body = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                {"events": [ad("a1")]})
+            self.assertEqual(status, 202)
+            self.assertEqual(body["duplicates"], ["e-a1-shown"])
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_concurrent_overlapping_batches_keep_disjoint_and_flag_conflict(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+
+        def ev(eid, seq, at, ptype="ad_shown", payload=None):
+            return {"event_id": eid, "seq": seq, "type": ptype, "occurred_at": at,
+                    "payload": payload if payload is not None else {"ad_id": "x"}}
+
+        overlap = ev("e-shared", 3, NOW + 102, "gesture", {"kind": "tap"})
+        batch_x = [ev("e-x1", 1, NOW + 100, "ad_shown", {"ad_id": "x"}),
+                   ev("e-x2", 2, NOW + 101, "network_response", {"ad_id": "x"}),
+                   overlap]
+        batch_y = [overlap,  # 交叠且内容完全一致 → 重传判重
+                   ev("e-y1", 4, NOW + 103, "network_response", {"ad_id": "x"}),
+                   ev("e-y2", 5, NOW + 104, "gesture", {"kind": "swipe"})]
+
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def send(name, batch):
+            barrier.wait()
+            results[name] = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                 {"events": batch})
+
+        t1 = threading.Thread(target=send, args=("x", batch_x))
+        t2 = threading.Thread(target=send, args=("y", batch_y))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        statuses = {name: results[name][0] for name in results}
+        self.assertEqual(set(statuses.values()), {202})  # 内容一致的交叠不应报冲突
+        accepted = {eid for name in results for eid in results[name][1]["accepted"]}
+        duplicates = {eid for name in results for eid in results[name][1]["duplicates"]}
+        # 不相交部分全部保留，交叠事件恰好一方接收、另一方判重
+        self.assertEqual(accepted, {"e-x1", "e-x2", "e-y1", "e-y2", "e-shared"})
+        self.assertEqual(duplicates, {"e-shared"})
+        report = self.get(f"/tasks/{task['task_id']}")
+        self.assertEqual(report["event_count"], 5)
+
+    def test_concurrent_same_key_different_content_preserves_one_evidence(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+
+        def ev(placement):
+            return {"event_id": "e-dup", "seq": 1, "type": "ad_shown",
+                    "occurred_at": NOW + 100,
+                    "payload": {"ad_id": "a1", "placement": placement}}
+
+        original, tampered = ev("splash"), ev("lockscreen")
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def send(name, event):
+            barrier.wait()
+            results[name] = call("POST", f"{self.base}/tasks/{task['task_id']}/events",
+                                 {"events": [event]})
+
+        t1 = threading.Thread(target=send, args=("a", original))
+        t2 = threading.Thread(target=send, args=("b", tampered))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        codes = sorted(results[n][0] for n in results)
+        self.assertEqual(codes, [202, 400])
+        loser = next(n for n in results if results[n][0] == 400)
+        self.assertEqual(results[loser][1]["error"], "evidence_conflict")
+        self.assertEqual(results[loser][1]["conflicts"][0]["event_id"], "e-dup")
+        # 原证据唯一且未被覆盖
+        report = self.get(f"/tasks/{task['task_id']}")
+        self.assertEqual(report["event_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

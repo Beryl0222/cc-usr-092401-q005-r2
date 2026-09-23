@@ -10,9 +10,15 @@
 - **证据只增不改**：设备、构建、事件、规范版本只允许登记不允许覆盖。开发者提交新版
   得到新 `build_id`，旧构建证据原样保留；告知材料出具时对发现做快照，事后任何操作
   不改变材料内容。
-- **采集幂等**：事件按 `(task_id, event_id)` 去重，重传统一进入 `duplicates`；任务
-  完成后的迟到事件照常追加（标记 `late=true`）并触发追加判定，判定按指纹去重，不
-  产生重复发现，也不回改既有结论。
+- **批次原子接收**：事件以批次上报，整批先校验字段、序号（正整数）、时间戳与事件
+  类型并检测批次内 `event_id` 重复；任何一条不合规，整批拒绝，任务、发现、案件与
+  磁盘快照都不改变，绝不部分写入。
+- **采集幂等与证据冲突**：事件按 `(task_id, event_id)` 去重，并对序号、类型、时间、
+  payload 计算规范化内容摘要（键序无关）；摘要一致判为完全重传进入 `duplicates`，
+  同键异内容判为证据冲突，原证据原样保留，接口返回 `400 evidence_conflict` 及可定位
+  的 `conflicts`（任务、事件号、双方摘要）。任务完成后的迟到事件照常追加（标记
+  `late=true`）并触发追加判定，判定按指纹去重，不产生重复发现或整改通知，也不回改
+  既有结论与已冻结版本。
 - **版本固化**：创建任务时固化当时生效的规范版本与最新脚本版本；规范或脚本更新只
   影响之后创建的任务，旧任务永远按原版本判定。
 - **规则与复核分离**：自动规则只能产生 `suspected`（涉嫌）发现；复核员 `confirmed`
@@ -39,7 +45,7 @@
 python3 service.py --check          # 基础自检
 python3 service.py --port 8000      # 启动服务
 LAB_DATA_FILE=lab.json python3 service.py   # 证据快照落盘，重启恢复
-npm test                            # 运行契约 + 领域 + HTTP 共 18 项测试
+npm test                            # 运行契约 + 领域 + HTTP 共 29 项测试
 ```
 
 ## 接口一览
@@ -54,7 +60,7 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 | `POST /devices` | 登记设备（`device_id`、`model`、`os_version`） |
 | `POST /builds` | 登记应用构建（`app_id`、`app_name`、`developer`、`version_code`） |
 | `POST /tasks` | 创建采集任务（`build_id`、`device_id`、`track`），响应含固化版本 |
-| `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates` |
+| `POST /tasks/{id}/events` | 原子上报事件批次 `{"events": [...]}`，整批校验后一次提交，返回 `accepted/duplicates`；同键异内容返回 `400 evidence_conflict` |
 | `POST /tasks/{id}/complete` | 完成采集并运行规则 |
 | `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据 |
 | `GET /builds/{id}/report` | 同一构建跨设备、跨轨迹汇总 |
@@ -84,6 +90,24 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
     "peak_rotation_deg": 10,
     "reading_seconds": 1
   }
+}
+```
+
+### 批次校验与证据冲突
+
+- 整批任一事件缺少必填字段、`seq` 非正整数、`occurred_at` 非数值时间戳、`type`
+  非法，或批次内 `event_id` 重复，均返回 `400 domain_error` 且整批不落任何状态。
+- 同一 `(task_id, event_id)` 复用但规范化内容（`seq/type/occurred_at/payload`）
+  不同时，返回 `400 evidence_conflict`，响应体含可定位明细，原证据不被覆盖：
+
+```json
+{
+  "error": "evidence_conflict",
+  "message": "事件内容与已存证据冲突，原证据已保留：e-a1-shown",
+  "conflicts": [
+    {"task_id": "task-0001", "event_id": "e-a1-shown",
+     "received_digest": "…", "stored_digest": "…"}
+  ]
 }
 ```
 

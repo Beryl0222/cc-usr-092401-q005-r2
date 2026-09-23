@@ -16,6 +16,7 @@ from domain import (
     TRACK_NORMAL,
     TRACK_SCREEN_READER,
     DomainError,
+    EvidenceConflictError,
     Lab,
     NotFoundError,
 )
@@ -423,6 +424,156 @@ class DomainFlowTest(unittest.TestCase):
         new_device = restored.register_device(
             {"device_id": "device-C", "model": "Pixel 10", "os_version": "Android 15"})
         self.assertTrue(new_device["device_id"])  # ID 序列不与既有编号冲突
+
+    # ---------------------------------------------------------------- #
+    # 批次原子性：混合坏批次整批回滚，不得部分写入
+    # ---------------------------------------------------------------- #
+
+    def _event_count(self):
+        return len(self.lab.events)
+
+    def test_mixed_bad_batch_is_fully_rejected(self):
+        task = self._task(DEV_A, TRACK_NORMAL)
+        good = [ad("a1"), close("a1", 2, after=1, size=48)]
+        # 前两条合法、末条类型非法
+        bad = good + [{"event_id": "e-bad", "seq": 3, "type": "trojan",
+                       "occurred_at": NOW + 200, "payload": {}}]
+        with self.assertRaises(DomainError):
+            self.lab.ingest_events(task["task_id"], bad)
+        # 整批回滚：任务、事件仓储都没有前序两条
+        self.assertEqual(self._event_count(), 0)
+        self.assertEqual(self.lab.tasks[task["task_id"]]["event_ids"], [])
+
+        # 各类字段/序号/时间不合规同样整批拒绝
+        def reject(batch):
+            with self.assertRaises(DomainError):
+                self.lab.ingest_events(task["task_id"], batch)
+            self.assertEqual(self._event_count(), 0)
+            self.assertEqual(self.lab.tasks[task["task_id"]]["event_ids"], [])
+
+        reject([{"event_id": "e1", "seq": 1, "type": "ad_shown"}])  # 缺 occurred_at
+        reject([ad("a1"), {"event_id": "e-a1-shown", "seq": 9,  # 批次内 event_id 重复
+                           "type": "gesture", "occurred_at": NOW}])
+        reject([{"event_id": "e1", "seq": 0, "type": "gesture", "occurred_at": NOW}])  # seq 非正
+        reject([{"event_id": "e1", "seq": "1", "type": "gesture",
+                 "occurred_at": NOW}])  # seq 非整数
+        reject([{"event_id": "e1", "seq": 1, "type": "gesture",
+                 "occurred_at": "soon"}])  # 时间戳非法
+
+    def test_failed_batch_does_not_leak_on_later_good_batch_or_snapshot(self):
+        """复现缺陷：坏批次的前序事件不得被下一次合法操作悄悄落盘。"""
+        task = self._task(DEV_A, TRACK_NORMAL)
+        bad = [ad("a1"), close("a1", 2, after=1, size=48),
+               {"event_id": "e-bad", "seq": 3, "type": "trojan", "occurred_at": NOW}]
+        with self.assertRaises(DomainError):
+            self.lab.ingest_events(task["task_id"], bad)
+
+        # 下一次合法操作（另一条干净批次）成功后做快照：坏批次的前序事件不在快照里
+        good = self.lab.ingest_events(task["task_id"],
+                                      [ad("z1"), close("z1", 2, after=1, size=48)])
+        self.assertEqual(good["accepted"], ["e-z1-shown", "e-z1-close-2"])
+        snap = self.lab.to_snapshot()
+        snap_ids = {item["key"][1] for item in snap["events"]}
+        self.assertEqual(snap_ids, {"e-z1-shown", "e-z1-close-2"})
+        self.assertNotIn("e-a1-shown", snap_ids)
+
+    # ---------------------------------------------------------------- #
+    # 证据冲突：同一事件标识不同内容必须保留原证据并可定位
+    # ---------------------------------------------------------------- #
+
+    def test_same_id_different_content_conflicts_and_keeps_original(self):
+        task = self._task(DEV_A, TRACK_NORMAL)
+        original = ad("a1")
+        self.lab.ingest_events(task["task_id"], [original])
+        stored = self.lab.events[(task["task_id"], "e-a1-shown")]
+        original_payload = dict(stored["payload"])
+
+        # 复用 event_id 但内容不同（placement 被篡改）
+        tampered = dict(original)
+        tampered["payload"] = {"ad_id": "a1", "placement": "lockscreen"}
+        with self.assertRaises(EvidenceConflictError) as ctx:
+            self.lab.ingest_events(task["task_id"], [tampered])
+        conflict = ctx.exception.conflicts[0]
+        self.assertEqual(conflict["task_id"], task["task_id"])
+        self.assertEqual(conflict["event_id"], "e-a1-shown")
+        self.assertTrue(conflict["received_digest"])
+        self.assertNotEqual(conflict["received_digest"], conflict["stored_digest"])
+
+        # 原证据原样保留，冲突上报不进入 duplicates
+        self.assertEqual(self.lab.events[(task["task_id"], "e-a1-shown")]["payload"],
+                         original_payload)
+        self.assertEqual(self.lab.tasks[task["task_id"]]["event_ids"], ["e-a1-shown"])
+
+    def test_conflict_batch_rolls_back_otherwise_valid_siblings(self):
+        task = self._task(DEV_A, TRACK_NORMAL)
+        self.lab.ingest_events(task["task_id"], [ad("a1")])
+        tampered = dict(ad("a1"))
+        tampered["payload"] = {"ad_id": "a1", "placement": "lockscreen"}
+        # 同批含一条全新合法事件：因冲突整批拒绝，合法兄弟也不得提交
+        with self.assertRaises(EvidenceConflictError):
+            self.lab.ingest_events(task["task_id"],
+                                   [tampered, network("a1", 7, NOW + 120, 200, "u")])
+        self.assertNotIn((task["task_id"], "e-a1-net-7"), self.lab.events)
+        self.assertEqual(self.lab.tasks[task["task_id"]]["event_ids"], ["e-a1-shown"])
+
+    def test_identical_retransmission_dedups_regardless_of_key_order(self):
+        task = self._task(DEV_A, TRACK_NORMAL)
+        self.lab.ingest_events(task["task_id"], [ad("a1")])
+        # 内容一致、仅 JSON 键序不同（规范化摘要应判为完全重传）
+        retransmit = {"payload": {"placement": "splash", "ad_id": "a1"},
+                      "occurred_at": NOW + 100, "type": "ad_shown",
+                      "seq": 1, "event_id": "e-a1-shown"}
+        result = self.lab.ingest_events(task["task_id"], [retransmit])
+        self.assertEqual(result["duplicates"], ["e-a1-shown"])
+        self.assertEqual(result["accepted"], [])
+
+    # ---------------------------------------------------------------- #
+    # 迟到与乱序：触发重评，但冻结版本不变、发现/通知不重复
+    # ---------------------------------------------------------------- #
+
+    def test_late_out_of_order_events_reassess_without_changing_frozen_versions(self):
+        task = self._task(DEV_A, TRACK_NORMAL)
+        self.lab.ingest_events(task["task_id"], [ad("a1"), close("a1", 2, after=1, size=48)])
+        self.lab.complete_task(task["task_id"])
+
+        # 任务冻结后再发布新规范、新脚本：不得影响既有任务的重评
+        self.clock.advance(86400)
+        self.lab.register_regulation({
+            "version": "v2026.1", "effective_at": self.clock(),
+            "params": {"close_max_delay_seconds": 1.0, "rectification_days": 5}})
+        self.lab.register_script({"script_id": "ad-trip", "version": "2.0",
+                                  "created_at": self.clock()})
+
+        # 迟到且乱序到达：seq 9 的跳转先于补洞的 seq 3 网络事件
+        late = self.lab.ingest_events(task["task_id"], [
+            jump("a1", 9, NOW + 200, "auto", sdk=SDK_ID),  # 乱序、迟到
+            ad("a1"),                                       # 完全重传
+        ])
+        self.assertEqual(late["accepted"], ["e-a1-jump-9"])
+        self.assertEqual(late["duplicates"], ["e-a1-shown"])
+        self.assertTrue(late["late_arrivals"])
+        self.assertEqual(len(late["assessment"]["new_suspected_findings"]), 1)
+        new_id = late["assessment"]["new_suspected_findings"][0]
+        self.assertEqual(self.lab.findings[new_id]["rule_id"], RULE_AUTO_JUMP)
+        self.assertEqual(self.lab.findings[new_id]["regulation_version"], "v2025.1")
+        self.assertTrue(self.lab.events[(task["task_id"], "e-a1-jump-9")]["late"])
+
+        # 冻结版本未被乱序/迟到事件改变
+        stored_task = self.lab.tasks[task["task_id"]]
+        self.assertEqual(stored_task["regulation_version"], "v2025.1")
+        self.assertEqual(stored_task["script"], {"script_id": "ad-trip", "version": "1.0"})
+
+        # 又一条迟到的补洞事件（seq 3、时间早于 seq 9）再次触发重评：
+        # 既有发现按指纹不重复生成，整改通知也绝不自动产生
+        again = self.lab.ingest_events(task["task_id"], [
+            network("a1", 3, NOW + 120, 200, "https://ad.example/i"),
+        ])
+        self.assertEqual(again["accepted"], ["e-a1-net-3"])
+        self.assertEqual(again["assessment"]["new_suspected_findings"], [])
+        task_findings = [f for f in self.lab.findings.values()
+                         if f["task_id"] == task["task_id"]]
+        self.assertEqual(len(task_findings), 1)
+        self.assertEqual(self.lab.notices, {})
 
     def _finding(self, task, rule_id):
         rows = [f for f in self.lab.findings.values()

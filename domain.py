@@ -13,6 +13,8 @@
   开启新的周期并累计回潮次数。
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from itertools import count
 from time import time
@@ -91,6 +93,16 @@ class NotFoundError(LookupError):
     """引用的实体不存在。"""
 
 
+class EvidenceConflictError(DomainError):
+    """同一事件标识上传了不同内容：原证据保留，冲突需可定位。"""
+
+    def __init__(self, conflicts):
+        # conflicts: [{event_id, received_digest, stored_digest}]
+        self.conflicts = conflicts
+        ids = ", ".join(sorted({c["event_id"] for c in conflicts}))
+        super().__init__(f"事件内容与已存证据冲突，原证据已保留：{ids}")
+
+
 def _require(payload, key, entity):
     if key not in payload or payload[key] in (None, ""):
         raise DomainError(f"{entity}缺少必填字段：{key}")
@@ -99,6 +111,51 @@ def _require(payload, key, entity):
 
 def _subject_key(subject):
     return (subject["type"], subject["id"])
+
+
+def _canonical_json(value):
+    """规范化序列化：键排序、去空白，作为内容摘要的唯一依据。"""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _content_digest(raw):
+    """对事件业务内容（seq/type/occurred_at/payload）计算规范化摘要。
+
+    不含 event_id（它是判重键）与接收侧元数据（received_at/late），
+    使「同一事件重传」只取决于业务内容。
+    """
+    material = {
+        "seq": raw["seq"],
+        "type": raw["type"],
+        "occurred_at": raw["occurred_at"],
+        "payload": raw.get("payload", {}),
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _validate_event_fields(raw, index):
+    """校验单条事件的字段、序号、时间与事件类型，返回规整后的业务字段。"""
+    where = f"批次第 {index + 1} 条事件"
+    if not isinstance(raw, dict):
+        raise DomainError(f"{where}不是合法的事件对象")
+    event_id = _require(raw, "event_id", where)
+    if not isinstance(event_id, str):
+        raise DomainError(f"{where}的 event_id 必须是字符串")
+    seq = _require(raw, "seq", where)
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
+        raise DomainError(f"{where}（event_id={event_id}）的 seq 必须是正整数")
+    occurred_at = _require(raw, "occurred_at", where)
+    if not isinstance(occurred_at, (int, float)) or isinstance(occurred_at, bool):
+        raise DomainError(f"{where}（event_id={event_id}）的 occurred_at 必须是数值时间戳")
+    event_type = _require(raw, "type", where)
+    if event_type not in EVENT_TYPES:
+        raise DomainError(
+            f"{where}（event_id={event_id}）的事件类型非法：{event_type}，"
+            f"允许值：{', '.join(EVENT_TYPES)}"
+        )
+    if "payload" in raw and not isinstance(raw["payload"], dict):
+        raise DomainError(f"{where}（event_id={event_id}）的 payload 必须是对象")
+    return event_id, seq, event_type, occurred_at
 
 
 def _display_subject(subject):
@@ -253,40 +310,80 @@ class Lab:
         return task
 
     def ingest_events(self, task_id, events):
-        """幂等接收一批事件。
+        """原子接收一批事件。
 
-        同一 (task_id, event_id) 重传直接判重，不产生重复证据；
-        任务完成后到达的迟到事件照常追加，并触发追加判定。
+        接收语义：
+        * 整批先做字段、序号、时间、事件类型校验，并检测批次内 event_id 重复；
+          任何一条不合规，整批拒绝，任务、发现、案件均不改变。
+        * 对 (task_id, event_id) 已存在的事件，按规范化内容摘要比对：摘要一致
+          判为完全重传（duplicates），摘要不一致判为证据冲突，原证据原样保留，
+          整批拒绝并返回可定位的冲突明细。
+        * 全部合规后一次性提交；任务完成后到达的迟到事件照常追加（late=true）
+          并触发追加判定。
         """
         task = self._get_task(task_id)
-        accepted, duplicates = [], []
-        late = False
-        for raw in events:
-            event_id = _require(raw, "event_id", "事件")
-            dedup_key = (task_id, event_id)
-            if dedup_key in self.events:
-                duplicates.append(event_id)
-                continue
-            event_type = _require(raw, "type", "事件")
-            if event_type not in EVENT_TYPES:
-                raise DomainError(f"未知事件类型：{event_type}")
-            event = {
+        if not isinstance(events, list):
+            raise DomainError("事件批次必须是数组：{\"events\": [...]}")
+
+        # 阶段一：整批校验，不触碰任何仓储状态
+        candidates = []
+        seen_in_batch = set()
+        for index, raw in enumerate(events):
+            event_id, seq, event_type, occurred_at = _validate_event_fields(raw, index)
+            if event_id in seen_in_batch:
+                raise DomainError(f"批次内 event_id 重复：{event_id}")
+            seen_in_batch.add(event_id)
+            candidates.append({
                 "event_id": event_id,
-                "task_id": task_id,
-                "seq": _require(raw, "seq", "事件"),
+                "seq": seq,
                 "type": event_type,
-                "occurred_at": _require(raw, "occurred_at", "事件"),
-                "received_at": self.clock(),
-                "late": task["status"] == "completed",
+                "occurred_at": occurred_at,
                 "payload": raw.get("payload", {}),
+                "digest": _content_digest(raw),
+            })
+
+        # 阶段二：对已存证据按内容摘要分类为完全重传或内容冲突
+        accepted, duplicates, conflicts = [], [], []
+        for cand in candidates:
+            stored = self.events.get((task_id, cand["event_id"]))
+            if stored is None:
+                accepted.append(cand)
+            else:
+                stored_digest = stored.get("digest") or _content_digest(stored)
+                if stored_digest == cand["digest"]:
+                    duplicates.append(cand["event_id"])
+                else:
+                    conflicts.append({
+                        "task_id": task_id,
+                        "event_id": cand["event_id"],
+                        "received_digest": cand["digest"],
+                        "stored_digest": stored_digest,
+                    })
+        if conflicts:
+            raise EvidenceConflictError(conflicts)
+
+        # 阶段三：全部合规才一次性提交（迟到标记在提交时按任务状态确定）
+        late = False
+        received_at = self.clock()
+        is_late_batch = task["status"] == "completed"
+        for cand in accepted:
+            event = {
+                "event_id": cand["event_id"],
+                "task_id": task_id,
+                "seq": cand["seq"],
+                "type": cand["type"],
+                "occurred_at": cand["occurred_at"],
+                "received_at": received_at,
+                "late": is_late_batch,
+                "payload": cand["payload"],
+                "digest": cand["digest"],
             }
-            self.events[dedup_key] = event
-            task["event_ids"].append(event_id)
-            accepted.append(event_id)
-            if event["late"]:
+            self.events[(task_id, cand["event_id"])] = event
+            task["event_ids"].append(cand["event_id"])
+            if is_late_batch:
                 late = True
-        result = {"accepted": accepted, "duplicates": duplicates}
-        if accepted and task["status"] == "completed":
+        result = {"accepted": [c["event_id"] for c in accepted], "duplicates": duplicates}
+        if accepted and is_late_batch:
             result["assessment"] = self._evaluate(task)
             result["late_arrivals"] = late
         return result

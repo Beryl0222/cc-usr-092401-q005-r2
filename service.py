@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from domain import (
     DomainError,
+    EvidenceConflictError,
     Lab,
     NotFoundError,
 )
@@ -185,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json_404()
         except NotFoundError as exc:
             self._send_json(404, {"error": "not_found", "message": str(exc)})
+        except EvidenceConflictError as exc:
+            # 同键异内容：原证据原样保留，返回可定位的冲突明细
+            self._send_json(400, {
+                "error": "evidence_conflict",
+                "message": str(exc),
+                "conflicts": exc.conflicts,
+            })
         except DomainError as exc:
             self._send_json(400, {"error": "domain_error", "message": str(exc)})
 
